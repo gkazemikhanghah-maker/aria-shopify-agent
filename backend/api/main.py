@@ -16,6 +16,7 @@ import os
 import json
 import logging
 import uuid
+import asyncio
 
 from dotenv import load_dotenv
 
@@ -69,39 +70,35 @@ shopify_client = None
 vector_store = None
 memory_store = None
 product_agent = None
+is_ready = False
 
 
 @app.on_event("startup")
 async def startup():
-    """Initialize all services on server start."""
+    """Initialize services on server start. Heavy loading runs in background."""
     global shopify_client, vector_store, memory_store, product_agent
 
     logger.info("Starting Aria API v0.2...")
 
-    # 1. Shopify client
+    # 1. Shopify client (instant)
     shopify_client = create_shopify_client()
     health = await shopify_client.health_check()
     logger.info(f"Shopify: {health}")
 
-    # 2. Vector store
+    # 2. Vector store (instant connection, products loaded in background)
     use_mock_qdrant = os.getenv("QDRANT_USE_MOCK", "false").lower() in ("true", "1")
     vector_store = VectorStore(use_mock=use_mock_qdrant)
 
-    # Check if products are loaded
-    stats = vector_store.get_stats()
-    if stats.get("status") == "error" or stats.get("points_count", 0) == 0:
-        logger.info("No products in Qdrant, loading now...")
-        count = await vector_store.load_products(shopify_client)
-        logger.info(f"Loaded {count} products")
+    # 3. Memory store
+    use_mock_redis = os.getenv("REDIS_USE_MOCK", "false").lower() in ("true", "1")
+    if use_mock_redis:
+        memory_store = create_memory_store()
     else:
-        logger.info(f"Qdrant already has {stats['points_count']} products")
-
-    # 3. Memory store (Redis)
-    memory_store = create_memory_store()
+        memory_store = create_memory_store()
     mem_health = await memory_store.health_check()
-    logger.info(f"Memory (Redis): {mem_health}")
+    logger.info(f"Memory: {mem_health}")
 
-    # 4. Product agent (with memory!)
+    # 4. Product agent
     has_api_key = bool(os.getenv("ANTHROPIC_API_KEY"))
     product_agent = ProductAgent(
         vector_store=vector_store,
@@ -114,7 +111,27 @@ async def startup():
     else:
         logger.info("No API Key — using mock responses")
 
-    logger.info("Aria API ready!")
+    logger.info("Aria API ready! (products loading in background)")
+
+    # Load products in background so the server starts fast
+    asyncio.create_task(load_products_background())
+
+
+async def load_products_background():
+    """Load products into vector store in background after server starts."""
+    global is_ready
+    try:
+        stats = vector_store.get_stats()
+        if stats.get("status") == "error" or stats.get("points_count", 0) == 0:
+            logger.info("Loading products into vector store (background)...")
+            count = await vector_store.load_products(shopify_client)
+            logger.info(f"Background: loaded {count} products")
+        else:
+            logger.info(f"Vector store already has {stats['points_count']} products")
+        is_ready = True
+    except Exception as e:
+        logger.error(f"Background product loading failed: {e}")
+        is_ready = True  # Still mark as ready so the API works
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +162,8 @@ async def health():
         "status": "ok",
         "service": "aria-api",
         "version": "0.2.0",
-        "claude": "live" if not product_agent.use_mock else "mock",
+        "ready": is_ready,
+        "claude": "live" if (product_agent and not product_agent.use_mock) else "mock",
         "qdrant": qdrant_stats,
         "memory": mem_health,
     }
@@ -175,6 +193,13 @@ async def chat(request: ChatRequest):
     """Send a message and get an AI response."""
     logger.info(f"Chat [{request.session_id}]: {request.message}")
 
+    if not is_ready:
+        return ChatResponse(
+            response="I'm still warming up! Give me a few seconds and try again.",
+            products=[],
+            intent="loading",
+        )
+
     result = await product_agent.answer(
         question=request.message,
         session_id=request.session_id,
@@ -197,11 +222,9 @@ async def websocket_chat(websocket: WebSocket):
     """Real-time chat via WebSocket."""
     await websocket.accept()
 
-    # Generate a session ID for this connection
     session_id = str(uuid.uuid4())[:8]
     logger.info(f"WebSocket connected — session: {session_id}")
 
-    # Bump visit count
     if memory_store:
         await memory_store.bump_visit(session_id)
 
@@ -209,11 +232,9 @@ async def websocket_chat(websocket: WebSocket):
 
     try:
         while True:
-            # Receive message
             data = await websocket.receive_text()
             message_data = json.loads(data)
             user_message = message_data.get("message", "")
-            # Allow client to send their own session_id
             client_session = message_data.get("session_id", session_id)
 
             if not user_message:
@@ -221,7 +242,16 @@ async def websocket_chat(websocket: WebSocket):
 
             logger.info(f"WS [{client_session}]: {user_message}")
 
-            # Get AI response (with memory!)
+            if not is_ready:
+                await websocket.send_json({
+                    "type": "response",
+                    "response": "I'm still warming up! Give me a few seconds and try again.",
+                    "products": [],
+                    "intent": "loading",
+                    "session_id": client_session,
+                })
+                continue
+
             result = await product_agent.answer(
                 question=user_message,
                 session_id=client_session,
@@ -229,13 +259,11 @@ async def websocket_chat(websocket: WebSocket):
                 conversation_history=conversation_history,
             )
 
-            # Update conversation history (keep last 10 exchanges)
             conversation_history.append({"role": "user", "content": user_message})
             conversation_history.append({"role": "assistant", "content": result["response"]})
             if len(conversation_history) > 20:
                 conversation_history = conversation_history[-20:]
 
-            # Send response
             await websocket.send_json({
                 "type": "response",
                 "response": result["response"],
