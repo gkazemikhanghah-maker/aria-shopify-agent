@@ -1,0 +1,77 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=DM+Sans:ital,wght@0,400;0,500;1,400&display=swap');
+@import "tailwindcss";
+
+/* ============================================
+   Aria Chat Widget — Custom Styles
+   ============================================ */
+
+@theme {
+  --color-aria-primary: #6C5CE7;
+  --color-aria-primary-dark: #5A4BD1;
+  --color-aria-secondary: #A29BFE;
+  --color-aria-accent: #FD79A8;
+  --color-aria-bg: #0F0A1A;
+  --color-aria-surface: #1A1230;
+  --color-aria-surface-light: #241B3D;
+  --color-aria-text: #F0ECF9;
+  --color-aria-text-dim: #9B93B3;
+  --color-aria-border: #2D2450;
+  --color-aria-user-bubble: #6C5CE7;
+  --color-aria-bot-bubble: #1A1230;
+  --font-display: "Outfit", sans-serif;
+  --font-body: "DM Sans", sans-serif;
+}
+
+/* Scrollbar */
+.aria-scrollbar::-webkit-scrollbar {
+  width: 4px;
+}
+.aria-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.aria-scrollbar::-webkit-scrollbar-thumb {
+  background: var(--color-aria-border);
+  border-radius: 999px;
+}
+
+/* Typing animation */
+@keyframes typing-dot {
+  0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
+  30% { opacity: 1; transform: translateY(-4px); }
+}
+.typing-dot:nth-child(1) { animation: typing-dot 1.4s infinite 0s; }
+.typing-dot:nth-child(2) { animation: typing-dot 1.4s infinite 0.2s; }
+.typing-dot:nth-child(3) { animation: typing-dot 1.4s infinite 0.4s; }
+
+/* Message appear */
+@keyframes message-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.animate-message-in {
+  animation: message-in 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* Widget open */
+@keyframes widget-open {
+  from { opacity: 0; transform: translateY(20px) scale(0.9); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.animate-widget-open {
+  animation: widget-open 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* Pulse glow on FAB */
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(108, 92, 231, 0.4); }
+  50% { box-shadow: 0 0 0 12px rgba(108, 92, 231, 0); }
+}
+.animate-pulse-glow {
+  animation: pulse-glow 2.5s infinite;
+}
+
+/* Gradient shimmer for header */
+@keyframes shimmer {
+  0% { background-position: -200% center; }
+  100% { background-position: 200% center; }
+}
