@@ -1,63 +1,8 @@
-import { useState, useRef, useEffect } from 'react'
-import MessageBubble from './MessageBubble'
-import ProductCard from './ProductCard'
-import TypingIndicator from './TypingIndicator'
-
-const WS_URL = 'ws://localhost:8000/ws/chat'
-
-export default function ChatWindow({ onClose }) {
-  const [messages, setMessages] = useState([
-    {
-      role: 'assistant',
-      content: "Hey! I'm Aria, your shopping assistant ✨ What are you looking for today?",
-      products: [],
-    },
-  ])
-  const [input, setInput] = useState('')
-  const [isTyping, setIsTyping] = useState(false)
-  const [isConnected, setIsConnected] = useState(false)
-  const messagesEndRef = useRef(null)
-  const wsRef = useRef(null)
-  const inputRef = useRef(null)
-
-  // Auto-scroll to bottom
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, isTyping])
-
-  // Focus input on open
-  useEffect(() => {
-    inputRef.current?.focus()
-  }, [])
-
-  // WebSocket connection
-  useEffect(() => {
-    const connect = () => {
-      const ws = new WebSocket(WS_URL)
-
-      ws.onopen = () => {
-        setIsConnected(true)
-        console.log('Connected to Aria')
-      }
-
-      ws.onmessage = (event) => {
-        const data = JSON.parse(event.data)
-        setIsTyping(false)
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: 'assistant',
-            content: data.response,
-            products: data.products || [],
-          },
-        ])
-      }
-
-      ws.onclose = () => {
-        setIsConnected(false)
-        console.log('Disconnected from Aria')
-        // Retry after 3 seconds
-        setTimeout(connect, 3000)
+          // Fall back to REST API
+          console.log('Falling back to REST API')
+          setUseRest(true)
+          setIsConnected(true)
+        }
       }
 
       ws.onerror = () => {
@@ -76,17 +21,51 @@ export default function ChatWindow({ onClose }) {
     }
   }, [])
 
+  // REST API fallback
+  const sendViaRest = async (text) => {
+    try {
+      const resp = await fetch(`${API_BASE}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: text }),
+      })
+      const data = await resp.json()
+      setIsTyping(false)
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: 'assistant',
+          content: data.response,
+          products: data.products || [],
+        },
+      ])
+    } catch (err) {
+      setIsTyping(false)
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: 'assistant',
+          content: "Sorry, I'm having trouble connecting. Please try again!",
+          products: [],
+        },
+      ])
+    }
+  }
+
   const sendMessage = () => {
     const text = input.trim()
-    if (!text || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
+    if (!text) return
 
     // Add user message
     setMessages((prev) => [...prev, { role: 'user', content: text, products: [] }])
     setInput('')
     setIsTyping(true)
 
-    // Send via WebSocket
-    wsRef.current.send(JSON.stringify({ message: text }))
+    if (useRest || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+      sendViaRest(text)
+    } else {
+      wsRef.current.send(JSON.stringify({ message: text }))
+    }
   }
 
   const handleKeyDown = (e) => {
@@ -109,7 +88,10 @@ export default function ChatWindow({ onClose }) {
       setInput('')
       setMessages((prev) => [...prev, { role: 'user', content: text, products: [] }])
       setIsTyping(true)
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+
+      if (useRest || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+        sendViaRest(text)
+      } else {
         wsRef.current.send(JSON.stringify({ message: text }))
       }
     }, 100)
@@ -153,7 +135,6 @@ export default function ChatWindow({ onClose }) {
               role={msg.role}
               content={msg.content}
             />
-            {/* Product cards (show top 2) */}
             {msg.products && msg.products.length > 0 && (
               <div className="mt-2 ml-11 space-y-2">
                 {msg.products.slice(0, 2).map((product, j) => (
@@ -166,7 +147,6 @@ export default function ChatWindow({ onClose }) {
 
         {isTyping && <TypingIndicator />}
 
-        {/* Suggestion chips (only if 1 message) */}
         {messages.length === 1 && (
           <div className="flex flex-wrap gap-2 mt-2 ml-11">
             {suggestions.map((s, i) => (
