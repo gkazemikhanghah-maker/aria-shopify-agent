@@ -1,11 +1,10 @@
 """
-Aria API — FastAPI server with REST + WebSocket endpoints.
+Aria API v0.3 — Now with configurable personas.
 
-Endpoints:
-    GET  /health          — Health check
-    GET  /products        — List all products
-    POST /chat            — Send a message, get a response
-    WS   /ws/chat         — Real-time chat via WebSocket
+New:
+    GET  /personas         — List available personas
+    POST /persona/switch   — Switch active persona
+    Persona-driven responses in chat
 
 Usage:
     cd backend
@@ -19,8 +18,6 @@ import uuid
 import asyncio
 
 from dotenv import load_dotenv
-
-# Load .env BEFORE anything else
 load_dotenv()
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -30,6 +27,7 @@ from pydantic import BaseModel
 from tools.shopify_client import create_shopify_client
 from tools.vector_store import VectorStore
 from tools.memory import create_memory_store
+from persona.persona_engine import PersonaEngine
 from agents.product_agent import ProductAgent
 
 # ---------------------------------------------------------------------------
@@ -44,16 +42,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# App setup
+# App
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
     title="Aria — AI Sales Agent",
-    description="AI-powered shopping assistant for Shopify stores",
-    version="0.2.0",
+    description="Persona-driven AI shopping assistant",
+    version="0.3.0",
 )
 
-# CORS — allow widget from any origin
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -63,79 +60,80 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# Global state (initialized on startup)
+# Global state
 # ---------------------------------------------------------------------------
 
 shopify_client = None
 vector_store = None
 memory_store = None
+persona_engine = None
 product_agent = None
 is_ready = False
 
 
 @app.on_event("startup")
 async def startup():
-    """Initialize services on server start. Heavy loading runs in background."""
-    global shopify_client, vector_store, memory_store, product_agent
+    global shopify_client, vector_store, memory_store, persona_engine, product_agent
 
-    logger.info("Starting Aria API v0.2...")
+    logger.info("Starting Aria API v0.3...")
 
-    # 1. Shopify client (instant)
+    # 1. Shopify
     shopify_client = create_shopify_client()
     health = await shopify_client.health_check()
     logger.info(f"Shopify: {health}")
 
-    # 2. Vector store (instant connection, products loaded in background)
+    # 2. Vector store
     use_mock_qdrant = os.getenv("QDRANT_USE_MOCK", "false").lower() in ("true", "1")
     vector_store = VectorStore(use_mock=use_mock_qdrant)
 
-    # 3. Memory store
-    use_mock_redis = os.getenv("REDIS_USE_MOCK", "false").lower() in ("true", "1")
-    if use_mock_redis:
-        memory_store = create_memory_store()
-    else:
-        memory_store = create_memory_store()
+    # 3. Memory
+    memory_store = create_memory_store()
     mem_health = await memory_store.health_check()
     logger.info(f"Memory: {mem_health}")
 
-    # 4. Product agent
+    # 4. Persona Engine
+    persona_engine = PersonaEngine()
+    default_persona = os.getenv("ARIA_PERSONA", "fashion_influencer")
+    logger.info(f"Personas available: {persona_engine.list_personas()}")
+    logger.info(f"Default persona: {default_persona}")
+
+    # 5. Product Agent
     has_api_key = bool(os.getenv("ANTHROPIC_API_KEY"))
     product_agent = ProductAgent(
         vector_store=vector_store,
         memory_store=memory_store,
+        persona_engine=persona_engine,
+        persona_name=default_persona,
         use_mock=not has_api_key,
     )
 
     if has_api_key:
-        logger.info("Claude API Key found — using LIVE AI responses!")
+        logger.info("Claude API Key found — LIVE AI responses!")
     else:
-        logger.info("No API Key — using mock responses")
+        logger.info("No API Key — mock responses")
 
-    logger.info("Aria API ready! (products loading in background)")
-
-    # Load products in background so the server starts fast
+    logger.info("Aria API v0.3 ready!")
     asyncio.create_task(load_products_background())
 
 
 async def load_products_background():
-    """Load products into vector store in background after server starts."""
     global is_ready
     try:
         stats = vector_store.get_stats()
         if stats.get("status") == "error" or stats.get("points_count", 0) == 0:
-            logger.info("Loading products into vector store (background)...")
+            logger.info("Loading products (background)...")
             count = await vector_store.load_products(shopify_client)
-            logger.info(f"Background: loaded {count} products")
+            logger.info(f"Loaded {count} products")
         else:
-            logger.info(f"Vector store already has {stats['points_count']} products")
+            logger.info(f"Already have {stats['points_count']} products")
         is_ready = True
     except Exception as e:
-        logger.error(f"Background product loading failed: {e}")
-        is_ready = True  # Still mark as ready so the API works
+        logger.error(f"Product loading failed: {e}")
+        is_ready = True
 
 
 # ---------------------------------------------------------------------------
-# Request / Response models
+# Models
 # ---------------------------------------------------------------------------
 
 class ChatRequest(BaseModel):
@@ -147,6 +145,11 @@ class ChatResponse(BaseModel):
     response: str
     products: list[dict] = []
     intent: str = ""
+    persona: str = ""
+
+
+class SwitchPersonaRequest(BaseModel):
+    persona: str
 
 
 # ---------------------------------------------------------------------------
@@ -155,23 +158,53 @@ class ChatResponse(BaseModel):
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
-    qdrant_stats = vector_store.get_stats() if vector_store else {"status": "not_initialized"}
-    mem_health = await memory_store.health_check() if memory_store else {"status": "not_initialized"}
+    qdrant_stats = vector_store.get_stats() if vector_store else {}
+    mem_health = await memory_store.health_check() if memory_store else {}
     return {
         "status": "ok",
         "service": "aria-api",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "ready": is_ready,
+        "persona": product_agent.persona_name if product_agent else None,
         "claude": "live" if (product_agent and not product_agent.use_mock) else "mock",
         "qdrant": qdrant_stats,
         "memory": mem_health,
     }
 
 
+@app.get("/personas")
+async def list_personas():
+    """List all available personas."""
+    personas = []
+    for name in persona_engine.list_personas():
+        config = persona_engine.get_persona(name)
+        personas.append({
+            "name": name,
+            "role": config.get("role", ""),
+            "tone": config.get("tone", ""),
+            "greeting": config.get("greeting", ""),
+            "active": name == product_agent.persona_name,
+        })
+    return {"personas": personas, "active": product_agent.persona_name}
+
+
+@app.post("/persona/switch")
+async def switch_persona(request: SwitchPersonaRequest):
+    """Switch the active persona."""
+    available = persona_engine.list_personas()
+    if request.persona not in available:
+        return {"error": f"Persona '{request.persona}' not found", "available": available}
+
+    product_agent.switch_persona(request.persona)
+    return {
+        "status": "ok",
+        "persona": request.persona,
+        "greeting": product_agent.greeting,
+    }
+
+
 @app.get("/products")
 async def list_products():
-    """List all products from Shopify."""
     products = await shopify_client.get_products()
     return {
         "count": len(products),
@@ -190,14 +223,14 @@ async def list_products():
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """Send a message and get an AI response."""
     logger.info(f"Chat [{request.session_id}]: {request.message}")
 
     if not is_ready:
         return ChatResponse(
-            response="I'm still warming up! Give me a few seconds and try again.",
+            response="Give me a sec, I'm warming up! ✨",
             products=[],
             intent="loading",
+            persona=product_agent.persona_name,
         )
 
     result = await product_agent.answer(
@@ -210,20 +243,20 @@ async def chat(request: ChatRequest):
         response=result["response"],
         products=result["products"],
         intent=result["intent"],
+        persona=result["persona"],
     )
 
 
 # ---------------------------------------------------------------------------
-# WebSocket endpoint (for real-time chat in the widget)
+# WebSocket
 # ---------------------------------------------------------------------------
 
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
-    """Real-time chat via WebSocket."""
     await websocket.accept()
 
     session_id = str(uuid.uuid4())[:8]
-    logger.info(f"WebSocket connected — session: {session_id}")
+    logger.info(f"WS connected — session: {session_id}")
 
     if memory_store:
         await memory_store.bump_visit(session_id)
@@ -245,10 +278,10 @@ async def websocket_chat(websocket: WebSocket):
             if not is_ready:
                 await websocket.send_json({
                     "type": "response",
-                    "response": "I'm still warming up! Give me a few seconds and try again.",
+                    "response": "Give me a sec, I'm warming up! ✨",
                     "products": [],
                     "intent": "loading",
-                    "session_id": client_session,
+                    "persona": product_agent.persona_name,
                 })
                 continue
 
@@ -269,11 +302,12 @@ async def websocket_chat(websocket: WebSocket):
                 "response": result["response"],
                 "products": result["products"],
                 "intent": result["intent"],
+                "persona": result["persona"],
                 "session_id": client_session,
             })
 
     except WebSocketDisconnect:
-        logger.info(f"WebSocket disconnected — session: {session_id}")
+        logger.info(f"WS disconnected — session: {session_id}")
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"WS error: {e}")
         await websocket.close()

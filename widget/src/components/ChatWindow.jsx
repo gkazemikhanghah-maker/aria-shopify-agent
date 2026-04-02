@@ -15,7 +15,7 @@ export default function ChatWindow({ onClose }) {
   const [messages, setMessages] = useState([
     {
       role: 'assistant',
-      content: "Hey! I'm Aria, your shopping assistant. What are you looking for today?",
+      content: "hey! i'm Aria ✨ what are you looking for today?",
       products: [],
     },
   ])
@@ -110,7 +110,7 @@ export default function ChatWindow({ onClose }) {
         ...prev,
         {
           role: 'assistant',
-          content: "Sorry, I'm having trouble connecting. Please try again!",
+          content: "sorry, having a connection issue — try again in a sec!",
           products: [],
         },
       ])
@@ -140,9 +140,10 @@ export default function ChatWindow({ onClose }) {
   }
 
   const suggestions = [
-    "What's popular right now?",
-    "Show me winter jackets",
-    "Something under $50",
+    "What's trending right now?",
+    "I need a skincare routine",
+    "Something cozy for my room",
+    "Best headphones under $150",
   ]
 
   const handleSuggestion = (text) => {
@@ -187,7 +188,7 @@ export default function ChatWindow({ onClose }) {
             <MessageBubble role={msg.role} content={msg.content} />
             {msg.products && msg.products.length > 0 && (
               <div className="mt-2 ml-11 space-y-2">
-                {msg.products.slice(0, 2).map((product, j) => (
+                {msg.products.slice(0, 3).map((product, j) => (
                   <ProductCard key={j} product={product} />
                 ))}
               </div>

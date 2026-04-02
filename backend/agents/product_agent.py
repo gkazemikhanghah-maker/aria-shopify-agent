@@ -1,11 +1,8 @@
 """
-Product Agent — Answers product questions using RAG + Claude + Memory.
+Product Agent — Answers product questions using RAG + Claude + Memory + Persona.
 
-This is the core agent that:
-1. Takes a customer question
-2. Loads customer memory (returning customer? preferences?)
-3. Searches the vector store for relevant products
-4. Sends context + question to Claude for a natural answer
+Now persona-driven: the same product gets recommended differently
+depending on the store's configured personality.
 """
 
 import os
@@ -16,6 +13,7 @@ from anthropic import AsyncAnthropic
 
 from tools.vector_store import VectorStore
 from tools.memory import MemoryStore
+from persona.persona_engine import PersonaEngine
 
 logger = logging.getLogger(__name__)
 
@@ -26,27 +24,6 @@ logger = logging.getLogger(__name__)
 SONNET_MODEL = "claude-sonnet-4-20250514"
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
-SYSTEM_PROMPT = """You are Aria, a friendly and knowledgeable AI shopping assistant.
-
-Your job is to help customers find the perfect products. You are:
-- Warm, helpful, and conversational (not robotic)
-- Knowledgeable about the products in the store
-- Honest — if something isn't available or doesn't match, say so
-- Proactive — suggest complementary products when relevant
-- Concise — keep answers short and scannable (2-4 sentences max)
-
-When answering:
-- Use the product information provided to give accurate answers
-- Include prices when mentioning products
-- If multiple products match, briefly compare them
-- If nothing matches well, say so honestly and suggest alternatives
-- Never make up product details that aren't in the context
-- If this is a returning customer, acknowledge their previous interests naturally
-  (e.g. "Still thinking about that jacket?" or "Welcome back!")
-
-Format: Use plain text. No markdown headers or bullet points.
-Keep it conversational, like a real store associate would talk."""
-
 
 # ---------------------------------------------------------------------------
 # Product Agent
@@ -54,10 +31,16 @@ Keep it conversational, like a real store associate would talk."""
 
 class ProductAgent:
     """
-    Answers product questions using RAG (vector search) + Claude + Memory.
+    Persona-driven product agent.
 
     Usage:
-        agent = ProductAgent(vector_store=store, memory_store=memory)
+        engine = PersonaEngine()
+        agent = ProductAgent(
+            vector_store=store,
+            memory_store=memory,
+            persona_engine=engine,
+            persona_name="fashion_influencer",
+        )
         response = await agent.answer("Do you have warm jackets?", session_id="abc")
     """
 
@@ -65,19 +48,34 @@ class ProductAgent:
         self,
         vector_store: VectorStore,
         memory_store: Optional[MemoryStore] = None,
+        persona_engine: Optional[PersonaEngine] = None,
+        persona_name: str = "fashion_influencer",
         api_key: Optional[str] = None,
         use_mock: bool = False,
     ):
         self.vector_store = vector_store
         self.memory_store = memory_store
+        self.persona_engine = persona_engine or PersonaEngine()
+        self.persona_name = persona_name
         self.use_mock = use_mock or not (api_key or os.getenv("ANTHROPIC_API_KEY"))
+
+        # Get system prompt from persona
+        self.system_prompt = self.persona_engine.get_system_prompt(persona_name)
+        self.greeting = self.persona_engine.get_greeting(persona_name)
 
         if not self.use_mock:
             self.client = AsyncAnthropic(api_key=api_key)
-            logger.info("ProductAgent using Claude API (LIVE)")
+            logger.info(f"ProductAgent using Claude API (LIVE) — persona: {persona_name}")
         else:
             self.client = None
-            logger.info("ProductAgent running in MOCK mode")
+            logger.info(f"ProductAgent in MOCK mode — persona: {persona_name}")
+
+    def switch_persona(self, persona_name: str) -> None:
+        """Switch to a different persona at runtime."""
+        self.persona_name = persona_name
+        self.system_prompt = self.persona_engine.get_system_prompt(persona_name)
+        self.greeting = self.persona_engine.get_greeting(persona_name)
+        logger.info(f"Switched persona to: {persona_name}")
 
     async def answer(
         self,
@@ -86,14 +84,12 @@ class ProductAgent:
         top_k: int = 3,
         conversation_history: Optional[list[dict]] = None,
     ) -> dict:
-        """
-        Answer a customer question with memory context.
-        """
+        """Answer a customer question with persona + memory context."""
+
         # 1. Get memory context
         memory_context = ""
         if self.memory_store:
             memory_context = await self.memory_store.get_context_summary(session_id)
-            logger.info(f"Memory context: {memory_context[:100]}...")
 
         # 2. Classify intent
         intent = await self._classify_intent(question)
@@ -103,10 +99,10 @@ class ProductAgent:
         products = await self.vector_store.search(question, top_k=top_k)
         logger.info(f"Found {len(products)} relevant products")
 
-        # 4. Build context from products
+        # 4. Build product context
         product_context = self._build_product_context(products)
 
-        # 5. Generate response
+        # 5. Generate response with persona
         response_text = await self._generate_response(
             question=question,
             product_context=product_context,
@@ -119,14 +115,10 @@ class ProductAgent:
         if self.memory_store:
             await self.memory_store.save_interaction(session_id, "user", question)
             await self.memory_store.save_interaction(session_id, "assistant", response_text)
-
-            # Track viewed products
             for p in products[:2]:
                 await self.memory_store.add_viewed_product(
                     session_id, p["product_id"], p["title"]
                 )
-
-            # Track preferences from intent
             if intent == "price_inquiry":
                 for p in products[:1]:
                     await self.memory_store.add_cart_interest(
@@ -137,12 +129,12 @@ class ProductAgent:
             "response": response_text,
             "products": products,
             "intent": intent,
+            "persona": self.persona_name,
         }
 
-    # -- Intent classification (fast, uses Haiku) ---------------------------
+    # -- Intent classification (Haiku) --------------------------------------
 
     async def _classify_intent(self, question: str) -> str:
-        """Classify the customer's intent using Haiku (fast + cheap)."""
         if self.use_mock:
             return self._mock_classify(question)
 
@@ -188,11 +180,11 @@ class ProductAgent:
                 f"  Type: {p.get('product_type', 'N/A')}\n"
                 f"  Price: {p['price_range']}\n"
                 f"  Tags: {tags}\n"
-                f"  Relevance score: {p['score']:.2f}"
+                f"  Relevance: {p['score']:.2f}"
             )
         return "\n\n".join(lines)
 
-    # -- Response generation (uses Sonnet) ----------------------------------
+    # -- Response generation (Sonnet + Persona) -----------------------------
 
     async def _generate_response(
         self,
@@ -205,21 +197,18 @@ class ProductAgent:
         if self.use_mock:
             return self._mock_response(question, product_context, intent)
 
-        # Build messages
         messages = []
-
         if conversation_history:
             messages.extend(conversation_history)
 
-        # Add current question with all context
-        user_message = f"Customer question: {question}\n\nCustomer intent: {intent}\n\n"
+        user_message = f"Customer question: {question}\nIntent: {intent}\n\n"
 
         if memory_context and "New customer" not in memory_context:
-            user_message += f"Customer memory (what we know about them):\n{memory_context}\n\n"
+            user_message += f"What you know about this customer:\n{memory_context}\n\n"
 
         user_message += (
-            f"Relevant products from our catalog:\n{product_context}\n\n"
-            f"Please answer the customer's question based on the products and memory above."
+            f"Products from the catalog:\n{product_context}\n\n"
+            f"Respond in character. Keep it short and natural."
         )
         messages.append({"role": "user", "content": user_message})
 
@@ -227,23 +216,23 @@ class ProductAgent:
             response = await self.client.messages.create(
                 model=SONNET_MODEL,
                 max_tokens=300,
-                system=SYSTEM_PROMPT,
+                system=self.system_prompt,
                 messages=messages,
             )
             return response.content[0].text
         except Exception as e:
             logger.error(f"Response generation failed: {e}")
-            return "I'm sorry, I'm having trouble right now. Could you try asking again?"
+            return "Sorry, I'm having a moment — try asking again!"
 
     # -- Mock response ------------------------------------------------------
 
     @staticmethod
     def _mock_response(question: str, product_context: str, intent: str) -> str:
         if intent == "greeting":
-            return "Hey there! Welcome to our store. I'm Aria, your shopping assistant. What are you looking for today?"
+            return "hey! welcome to the store ✨ what are you looking for today?"
 
         if "No matching products" in product_context:
-            return "I couldn't find anything matching that in our catalog. Could you describe what you're looking for differently?"
+            return "hmm i don't think we have that right now — can you describe it differently?"
 
         first_product = ""
         for line in product_context.split("\n"):
@@ -252,9 +241,9 @@ class ProductAgent:
                 break
 
         if intent == "price_inquiry":
-            return f"Great question! Our {first_product} is a popular choice. Check the product details for the latest pricing and available sizes."
+            return f"ooh the {first_product} is such a good pick! let me pull up the price details for you."
 
         if intent == "comparison":
-            return f"Good question! Let me help you compare. The {first_product} stands out for its quality. Want me to go into more detail on the differences?"
+            return f"ok so the {first_product} is definitely the standout here — want me to break down why?"
 
-        return f"Based on what you're looking for, I'd recommend checking out our {first_product}. It's one of our most popular items! Want to know more about it?"
+        return f"honestly the {first_product} is one of my favorites right now. want to know more about it?"
